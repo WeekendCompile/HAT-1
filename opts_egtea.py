@@ -206,7 +206,18 @@ def parse_opt():
         '--short_mem_tokens',
         type=int,
         default=8,
-        help='number of short-term memory tokens in DualMemoryUnit')
+        help='number of short-term memory tokens in DualMemoryUnit (legacy, kept for compatibility)')
+    parser.add_argument(
+        '--ablation_mode',
+        type=str,
+        default='full',
+        choices=['baseline', 'context_only', 'memory_only', 'full'],
+        help='Ablation mode: baseline (HAT), context_only, memory_only, or full (Context-Guided Memory Refinement)')
+    parser.add_argument(
+        '--save_attention',
+        default=False,
+        action='store_true',
+        help='Save attention maps for qualitative analysis')
 
     args = parser.parse_args()
 
