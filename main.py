@@ -20,7 +20,47 @@ from loss_func import cls_loss_func,  regress_loss_func
 from loss_func import MultiCrossEntropyLoss
 from functools import *
 
-def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
+
+def get_device_ids():
+    """
+    Automatically detect available GPUs and return device IDs.
+    Returns a list of GPU device IDs or None if no GPU is available.
+    """
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        device_ids = list(range(num_gpus))
+        print(f"Found {num_gpus} GPU(s): {device_ids}")
+        return device_ids
+    else:
+        print("No GPU available, using CPU")
+        return None
+
+
+def setup_model(model, device_ids):
+    """
+    Setup model with appropriate device configuration.
+    
+    Args:
+        model: The model to setup
+        device_ids: List of GPU device IDs or None for CPU
+    
+    Returns:
+        Configured model
+    """
+    if device_ids is not None and len(device_ids) > 0:
+        model = model.cuda()
+        if len(device_ids) > 1:
+            print(f"Using DataParallel with GPUs: {device_ids}")
+            model = torch.nn.DataParallel(model, device_ids=device_ids)
+        else:
+            print(f"Using single GPU: {device_ids[0]}")
+    else:
+        print("Using CPU")
+    
+    return model
+
+
+def train_one_epoch(opt, model, train_dataset, optimizer, device_ids, warmup=False):
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                 batch_size=opt['batch_size'], shuffle=True,
                                                 num_workers=0, pin_memory=True, drop_last=False)
@@ -38,34 +78,40 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
             for g in optimizer.param_groups:
                 g['lr'] = n_iter * (opt['lr']) / total_iter
 
+        # Move data to appropriate device
+        if device_ids is not None:
+            input_data = input_data.float().cuda()
+        else:
+            input_data = input_data.float()
+
         # HAT+ returns 4 values: anchor cls, anchor reg, history snip cls, context cls
-        act_cls, act_reg, snip_cls, ctx_cls = model(input_data.float().cuda())
+        act_cls, act_reg, snip_cls, ctx_cls = model(input_data)
 
         cost_reg = 0
         cost_cls = 0
 
         loss = cls_loss_func(cls_label, act_cls, use_focal=True)
         cost_cls = loss
-        epoch_cost_cls += cost_cls.detach().cpu().numpy()
+        epoch_cost_cls += cost_cls.item()  # FIXED: was .detach().cpu().numpy()
 
         loss = regress_loss_func(reg_label, act_reg)
         cost_reg = loss
-        epoch_cost_reg += cost_reg.detach().cpu().numpy()
+        epoch_cost_reg += cost_reg.item()  # FIXED: was .detach().cpu().numpy()
 
         loss = cls_loss_func(snip_label, snip_cls, use_focal=True)
         cost_snip = loss
-        epoch_cost_snip += cost_snip.detach().cpu().numpy()
+        epoch_cost_snip += cost_snip.item()  # FIXED: was .detach().cpu().numpy()
 
         # Context supervision: same snip_label, same focal loss — direct gradient
         # to HierarchicalContextEncoder so it actually learns current activity
         loss = cls_loss_func(snip_label, ctx_cls, use_focal=True)
         cost_ctx = loss
-        epoch_cost_ctx += cost_ctx.detach().cpu().numpy()
+        epoch_cost_ctx += cost_ctx.item()  # FIXED: was .detach().cpu().numpy()
 
         cost = (opt['alpha'] * cost_cls + opt['beta'] * cost_reg
                 + opt['gamma'] * cost_snip + opt['delta'] * cost_ctx)
 
-        epoch_cost += cost.detach().cpu().numpy()
+        epoch_cost += cost.item()  # FIXED: was .detach().cpu().numpy()
 
         optimizer.zero_grad()
         cost.backward()
@@ -74,8 +120,10 @@ def train_one_epoch(opt, model, train_dataset, optimizer, warmup=False):
     return n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip, epoch_cost_ctx
 
 
-def eval_one_epoch(opt, model, test_dataset):
-    cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model, test_dataset)
+def eval_one_epoch(opt, model, test_dataset, device_ids):
+    cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(
+        opt, model, test_dataset, device_ids
+    )
 
     result_dict = eval_map_nms(opt, test_dataset, output_cls, output_reg, labels_cls, labels_reg)
     output_dict = {"version": "VERSION 1.3", "results": result_dict, "external_data": {}}
@@ -92,27 +140,33 @@ def eval_one_epoch(opt, model, test_dataset):
 def train(opt):
     writer = SummaryWriter()
 
-    # Build model and wrap with DataParallel for dual GPU
-    model = MYNET(opt).cuda()
-    model = torch.nn.DataParallel(model, device_ids=[0, 1])
+    # Detect available GPUs
+    device_ids = get_device_ids()
+
+    # Build model and setup with available devices
+    model = MYNET(opt)
+    model = setup_model(model, device_ids)
 
     # HAT+ LR strategy (critical fix):
-    # Only long_mem_encoder + history_token get the slow 1e-6 LR —
+    # Only history_compressor + history_token get the slow 1e-6 LR —
     # these carry HAT's pre-learned history knowledge and mirror HAT's
     # original differential-LR intent.
-    # All newly added parameters (context_encoder, short_mem_encoder,
-    # memory_fusion, mem_gate, context_anchor_decoder_block, etc.) train
+    # All newly added parameters (context_encoder, memory_fusion,
+    # mem_gate, anchor_refinement_block, etc.) train
     # at full opt['lr'] so they can actually learn from scratch.
-    slow_lr_params = [param for name, param in model.named_parameters()
-                      if 'long_mem_encoder' in name
-                      or ('history_token' in name
-                          and 'short_mem_token' not in name
-                          and 'ctx_token' not in name)]
-    full_lr_params = [param for name, param in model.named_parameters()
-                      if not ('long_mem_encoder' in name
-                              or ('history_token' in name
-                                  and 'short_mem_token' not in name
-                                  and 'ctx_token' not in name))]
+    
+    # Handle DataParallel wrapper when accessing named_parameters
+    model_params = model.module.named_parameters() if isinstance(model, torch.nn.DataParallel) else model.named_parameters()
+    
+    slow_lr_params = [param for name, param in model_params
+                      if 'history_compressor' in name
+                      or 'history_token' in name]
+    
+    # Re-iterate for full_lr_params (named_parameters() is a generator)
+    model_params = model.module.named_parameters() if isinstance(model, torch.nn.DataParallel) else model.named_parameters()
+    full_lr_params = [param for name, param in model_params
+                      if not ('history_compressor' in name
+                              or 'history_token' in name)]
 
     optimizer = optim.Adam(
         [{'params': slow_lr_params, 'lr': 1e-6},
@@ -132,7 +186,7 @@ def train(opt):
             warmup = False
 
         n_iter, epoch_cost, epoch_cost_cls, epoch_cost_reg, epoch_cost_snip, epoch_cost_ctx = train_one_epoch(
-            opt, model, train_dataset, optimizer, warmup
+            opt, model, train_dataset, optimizer, device_ids, warmup
         )
 
         writer.add_scalars('data/cost', {'train': epoch_cost / (n_iter + 1)}, n_epoch)
@@ -149,29 +203,31 @@ def train(opt):
         scheduler.step()
         model.eval()
 
-        cls_loss, reg_loss, tot_loss, IoUmAP_5 = eval_one_epoch(opt, model, test_dataset)
+        cls_loss, reg_loss, tot_loss, IoUmAP_5 = eval_one_epoch(opt, model, test_dataset, device_ids)
 
         writer.add_scalars('data/mAP', {'test': IoUmAP_5}, n_epoch)
         print("testing loss(epoch %d): %.03f, cls - %f, reg - %f, mAP Avg - %f" % (
             n_epoch, tot_loss, cls_loss, reg_loss, IoUmAP_5
         ))
 
-        # Use .module to access state_dict and custom attributes on the underlying model
+        # Use .module to access state_dict and custom attributes when using DataParallel
+        model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
         state = {'epoch': n_epoch + 1,
-                 'state_dict': model.module.state_dict()}
+                 'state_dict': model_to_save.state_dict()}
         torch.save(state, opt["checkpoint_path"] + "/" + opt["exp"] + "_checkpoint_" + str(n_epoch + 1) + ".pth.tar")
 
-        if IoUmAP_5 > model.module.best_map:
-            model.module.best_map = IoUmAP_5
+        if IoUmAP_5 > model_to_save.best_map:
+            model_to_save.best_map = IoUmAP_5
             torch.save(state, opt["checkpoint_path"] + "/" + opt["exp"] + "_ckp_best.pth.tar")
 
         model.train()
 
     writer.close()
-    return model.module.best_map
+    model_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
+    return model_to_save.best_map
 
 
-def eval_frame(opt, model, dataset):
+def eval_frame(opt, model, dataset, device_ids):
     test_loader = torch.utils.data.DataLoader(dataset,
                                                batch_size=opt['batch_size'], shuffle=False,
                                                num_workers=0, pin_memory=True, drop_last=False)
@@ -193,22 +249,28 @@ def eval_frame(opt, model, dataset):
     epoch_cost_reg = 0
 
     for n_iter, (input_data, cls_label, reg_label, _) in enumerate(tqdm(test_loader)):
-        act_cls, act_reg, _, _ = model(input_data.float().cuda())
+        # Move data to appropriate device
+        if device_ids is not None:
+            input_data = input_data.float().cuda()
+        else:
+            input_data = input_data.float()
+            
+        act_cls, act_reg, _, _ = model(input_data)
         cost_reg = 0
         cost_cls = 0
 
         loss = cls_loss_func(cls_label, act_cls)
         cost_cls = loss
 
-        epoch_cost_cls += cost_cls.detach().cpu().numpy()
+        epoch_cost_cls += cost_cls.item()  # FIXED: was .detach().cpu().numpy()
 
         loss = regress_loss_func(reg_label, act_reg)
         cost_reg = loss
-        epoch_cost_reg += cost_reg.detach().cpu().numpy()
+        epoch_cost_reg += cost_reg.item()  # FIXED: was .detach().cpu().numpy()
 
         cost = opt['alpha'] * cost_cls + opt['beta'] * cost_reg
 
-        epoch_cost += cost.detach().cpu().numpy()
+        epoch_cost += cost.item()  # FIXED: was .detach().cpu().numpy()
 
         act_cls = torch.softmax(act_cls, dim=-1)
 
@@ -230,9 +292,9 @@ def eval_frame(opt, model, dataset):
         output_cls[video_name] = np.stack(output_cls[video_name], axis=0)
         output_reg[video_name] = np.stack(output_reg[video_name], axis=0)
 
-    cls_loss = epoch_cost_cls / n_iter
-    reg_loss = epoch_cost_reg / n_iter
-    tot_loss = epoch_cost / n_iter
+    cls_loss = float(epoch_cost_cls / n_iter)
+    reg_loss = float(epoch_cost_reg / n_iter)
+    tot_loss = float(epoch_cost / n_iter)
 
     return cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames
 
@@ -285,13 +347,15 @@ def eval_map_nms(opt, dataset, output_cls, output_reg, labels_cls, labels_reg):
     return result_dict
 
 
-def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg):
-    # Build SuppressNet and wrap with DataParallel for dual GPU
-    model = SuppressNet(opt).cuda()
-    model = torch.nn.DataParallel(model, device_ids=[0, 1])
+def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg, device_ids):
+    # Build SuppressNet and setup with available devices
+    model = SuppressNet(opt)
+    model = setup_model(model, device_ids)
+    
     checkpoint = torch.load(opt["checkpoint_path"] + "/ckp_best_suppress.pth.tar")
     base_dict = checkpoint['state_dict']
-    model.module.load_state_dict(base_dict)
+    model_to_load = model.module if isinstance(model, torch.nn.DataParallel) else model
+    model_to_load.load_state_dict(base_dict)
     model.eval()
 
     result_dict = {}
@@ -341,7 +405,9 @@ def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg
                 conf_queue[-1, cls_idx] = proposal["score"]
 
             minput = conf_queue.unsqueeze(0)
-            suppress_conf = model(minput.cuda())
+            if device_ids is not None:
+                minput = minput.cuda()
+            suppress_conf = model(minput)
             suppress_conf = suppress_conf.squeeze(0).detach().cpu().numpy()
 
             for cls in range(0, num_class - 1):
@@ -358,18 +424,25 @@ def eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg
 
 
 def test_frame(opt):
-    # Build MYNET and wrap with DataParallel for dual GPU
-    model = MYNET(opt).cuda()
-    model = torch.nn.DataParallel(model, device_ids=[0, 1])
+    # Detect available GPUs
+    device_ids = get_device_ids()
+    
+    # Build MYNET and setup with available devices
+    model = MYNET(opt)
+    model = setup_model(model, device_ids)
+    
     checkpoint = torch.load(opt["checkpoint_path"] + "/ckp_best.pth.tar")
     base_dict = checkpoint['state_dict']
-    model.module.load_state_dict(base_dict)
+    model_to_load = model.module if isinstance(model, torch.nn.DataParallel) else model
+    model_to_load.load_state_dict(base_dict)
     model.eval()
 
     dataset = VideoDataSet(opt, subset=opt['inference_subset'])
     outfile = h5py.File(opt['frame_result_file'].format(opt['exp']), 'w')
 
-    cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model, dataset)
+    cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(
+        opt, model, dataset, device_ids
+    )
 
     print("testing loss: %f, cls_loss: %f, reg_loss: %f" % (tot_loss, cls_loss, reg_loss))
 
@@ -415,22 +488,29 @@ class SaveOutput:
 
 
 def test(opt):
-    # Build MYNET and wrap with DataParallel for dual GPU
-    model = MYNET(opt).cuda()
-    model = torch.nn.DataParallel(model, device_ids=[0, 1])
+    # Detect available GPUs
+    device_ids = get_device_ids()
+    
+    # Build MYNET and setup with available devices
+    model = MYNET(opt)
+    model = setup_model(model, device_ids)
+    
     checkpoint = torch.load(opt["checkpoint_path"] + "/" + opt['exp'] + "_ckp_best.pth.tar")
     base_dict = checkpoint['state_dict']
-    model.module.load_state_dict(base_dict)
+    model_to_load = model.module if isinstance(model, torch.nn.DataParallel) else model
+    model_to_load.load_state_dict(base_dict)
     model.eval()
 
     dataset = VideoDataSet(opt, subset=opt['inference_subset'])
 
-    cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(opt, model, dataset)
+    cls_loss, reg_loss, tot_loss, output_cls, output_reg, labels_cls, labels_reg, working_time, total_frames = eval_frame(
+        opt, model, dataset, device_ids
+    )
 
     if opt["pptype"] == "nms":
         result_dict = eval_map_nms(opt, dataset, output_cls, output_reg, labels_cls, labels_reg)
     if opt["pptype"] == "net":
-        result_dict = eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg)
+        result_dict = eval_map_supnet(opt, dataset, output_cls, output_reg, labels_cls, labels_reg, device_ids)
 
     output_dict = {"version": "VERSION 1.3", "results": result_dict, "external_data": {}}
     outfile = open(opt["result_file"].format(opt['exp']), "w")
@@ -441,20 +521,27 @@ def test(opt):
 
 
 def test_online(opt):
-    # Build MYNET and wrap with DataParallel for dual GPU
-    model = MYNET(opt).cuda()
-    model = torch.nn.DataParallel(model, device_ids=[0, 1])
+    # Detect available GPUs
+    device_ids = get_device_ids()
+    
+    # Build MYNET and setup with available devices
+    model = MYNET(opt)
+    model = setup_model(model, device_ids)
+    
     checkpoint = torch.load(opt["checkpoint_path"] + "/ckp_best.pth.tar")
     base_dict = checkpoint['state_dict']
-    model.module.load_state_dict(base_dict)
+    model_to_load = model.module if isinstance(model, torch.nn.DataParallel) else model
+    model_to_load.load_state_dict(base_dict)
     model.eval()
 
-    # Build SuppressNet and wrap with DataParallel for dual GPU
-    sup_model = SuppressNet(opt).cuda()
-    sup_model = torch.nn.DataParallel(sup_model, device_ids=[0, 1])
+    # Build SuppressNet and setup with available devices
+    sup_model = SuppressNet(opt)
+    sup_model = setup_model(sup_model, device_ids)
+    
     checkpoint = torch.load(opt["checkpoint_path"] + "/ckp_best_suppress.pth.tar")
     base_dict = checkpoint['state_dict']
-    sup_model.module.load_state_dict(base_dict)
+    sup_model_to_load = sup_model.module if isinstance(sup_model, torch.nn.DataParallel) else sup_model
+    sup_model_to_load.load_state_dict(base_dict)
     sup_model.eval()
 
     dataset = VideoDataSet(opt, subset=opt['inference_subset'])
@@ -487,7 +574,9 @@ def test_online(opt):
             input_queue[-1:, :] = dataset._get_base_data(video_name, idx, idx + 1)
 
             minput = input_queue.unsqueeze(0)
-            act_cls, act_reg, _, _ = model(minput.cuda())
+            if device_ids is not None:
+                minput = minput.cuda()
+            act_cls, act_reg, _, _ = model(minput)
             act_cls = torch.softmax(act_cls, dim=-1)
 
             cls_anc = act_cls.squeeze(0).detach().cpu().numpy()
@@ -522,7 +611,9 @@ def test_online(opt):
                 sup_queue[-1, cls_idx] = proposal["score"]
 
             minput = sup_queue.unsqueeze(0)
-            suppress_conf = sup_model(minput.cuda())
+            if device_ids is not None:
+                minput = minput.cuda()
+            suppress_conf = sup_model(minput)
             suppress_conf = suppress_conf.squeeze(0).detach().cpu().numpy()
 
             for cls in range(0, num_class - 1):
